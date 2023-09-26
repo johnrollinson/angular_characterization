@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/angular_testing_automation.iml" filepath="$PROJECT_DIR$/.idea/angular_testing_automation.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../apd_char_automation/.idea/apd_char_automation.iml" filepath="$PROJECT_DIR$/../../apd_char_automation/.idea/apd_char_automation.iml" />
+    </modules>
+  </component>
+</project>
