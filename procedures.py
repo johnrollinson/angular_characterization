@@ -18,9 +18,7 @@ from stage.motor_ini.core import find_stages
 from stage.ctrl_msg import MGMSG_MOT_MOVE_JOG, MGMSG_MOT_SET_JOGPARAMS
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG)
-log.addHandler(logging.StreamHandler())
-
+log.setLevel(logging.INFO)
 
 # Connect to motors and set both stages to 0deg
 # SerNo's:
@@ -78,7 +76,7 @@ def move_stage_to(stage: MotorCtrl, targ_pos: float, blocking:bool=False, num_re
     so this is a simple wrapper function which reads the current position and moves
     to the desired position using the move_by() function.
     """
-    log.info(f"Moving {stage.stage_model} to {targ_pos}")
+    log.debug(f"Moving {stage.stage_model} to {targ_pos}")
 
     for _ in range(num_retries):
         # Compute the amount to move
@@ -229,9 +227,7 @@ class AngleSweep(Procedure):
     def startup(self):
         # Connect to picoammeter and set up current measurement
         log.info("Connecting and configuring the picoammeter ...")
-        adapter = VISAAdapter(
-            "GPIB0::22::INSTR", visa_library="@py", query_delay=0.1
-        )
+        adapter = VISAAdapter("GPIB0::22::INSTR", visa_library="@py")
         self.picoammeter = Keithley6487(adapter)
         self.picoammeter.configure(nplc=1)
         self.picoammeter.set_bias_voltage(self.bias_voltage)
