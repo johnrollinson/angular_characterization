@@ -1,25 +1,26 @@
 import logging
+from time import sleep
+from typing import List
+
+import numpy as np
+from pymeasure.adapters import VISAAdapter
+from pymeasure.experiment import (
+    BooleanParameter,
+    FloatParameter,
+    IntegerParameter,
+    Parameter,
+    Procedure,
+)
+from stage.ctrl_msg import MGMSG_MOT_MOVE_STOP, MGMSG_MOT_MOVE_VELOCITY
+from stage.motor_ctrl import MotorCtrl
+from stage.motor_ini.core import find_stages
 
 from agilent import E364A
 from keithley import Keithley6487
-import numpy as np
-from typing import List
-from time import sleep
-from pymeasure.adapters import VISAAdapter
-from pymeasure.experiment import Procedure
-from pymeasure.experiment import (
-    BooleanParameter,
-    IntegerParameter,
-    FloatParameter,
-    Parameter,
-)
-from stage.motor_ctrl import MotorCtrl
-from stage.motor_ini.core import find_stages
-from stage.ctrl_msg import MGMSG_MOT_MOVE_JOG, MGMSG_MOT_SET_JOGPARAMS
+from procedures import move_jog, move_stage_to, set_jog_step
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
-log.addHandler(logging.StreamHandler())
 
 
 # Connect to motors and set both stages to 0deg
@@ -42,10 +43,41 @@ if len(stages) != 0:
 else:
     log.error("No motor stages found.")
 
+def oscillate_stage(stage: MotorCtrl, min_angle, max_angle, velocity, stop_mode=1, interval=0.1):
+    # Set stage to starting position
+    move_stage_to(stage, min_angle)
+
+    # Set the maximum move velocity
+    stage.set_max_vel(velocity)
+    direction = 2
+
+    # Start the velocity movement
+    stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+    while True:
+        if direction == 1 and stage.pos > max_angle:
+            direction = direction%2 + 1
+            stage._port.send_message(MGMSG_MOT_MOVE_STOP(chan_ident=stage._chan_ident, stop_mode=stop_mode))
+            stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+        elif direction == 2 and stage.pos < min_angle:
+            direction = direction%2 + 1
+            stage._port.send_message(MGMSG_MOT_MOVE_STOP(chan_ident=stage._chan_ident, stop_mode=stop_mode))
+            stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+        sleep(interval)
 
 class VelocityAngleSweep(Procedure):
     """
-    Sweep angle over specified range and measure photocurrent at each increment
+    Sweep angle over specified range and measure photocurrent at each increment.
+
+    This procedure utilizes the "constant velocity" move mode of the motor controllers
+    rather than the fixed step move mode. In this mode, the idea is to read the current
+    and angular position as fast as possible while the DUT rotates at a constant
+    velocity. While this will result in noisy measurement, the goal is that we will be
+    reading fast enough to smooth out the data in post-processing (e.g. either using
+    spline fitting or nearest-neighbor smoothing). 
+    
+    Hopefully the continuous velocity movement combined with oversampling and smoothing
+    should reduce test time compared to the fixed step size method, while still getting
+    sufficiently accurate results.
     """
 
     test_name = Parameter("Test Name")
@@ -123,7 +155,7 @@ class VelocityAngleSweep(Procedure):
             "GPIB0::22::INSTR", visa_library="@py", query_delay=0.1
         )
         self.picoammeter = Keithley6487(adapter)
-        self.picoammeter.configure(nplc=1)
+        self.picoammeter.configure(nplc=0.1, n_avg=1)
         self.picoammeter.set_bias_voltage(self.bias_voltage)
         # Set up continuous triggering
         self.picoammeter.write("ARM:SOUR IMM")
@@ -368,4 +400,3 @@ class VelocityAngleSweep(Procedure):
         #     pass
         # sleep(2)
         # del self.roll_stage, self.pitch_stage
-        log.info("Procedure shutdown completed.")

@@ -34,7 +34,7 @@ class Keithley6487(Instrument):
     def reset(self):
         self.write("*RST")
 
-    def configure(self, nplc=1):
+    def configure(self, nplc=1, n_avg=3):
         """
         Perform basic configuration
         :return:
@@ -42,9 +42,12 @@ class Keithley6487(Instrument):
         self.reset()
         self.write('SYST:ZCH OFF')
         log.info("Zero-checking turned off")
-        self.write('AVER:COUN {:d}'.format(3))
-        self.write('AVER:TCON {:s}'.format('rep'))
-        self.write('AVER ON')
+        if n_avg > 1:
+            self.write('AVER:COUN {:d}'.format(n_avg))
+            self.write('AVER:TCON {:s}'.format('rep'))
+            self.write('AVER ON')
+        else:
+            self.write('AVER')
         self.write('SENS:CURR:NPLC {:0.2f}'.format(nplc))
         self.write("INIT")
 
