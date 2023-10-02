@@ -116,7 +116,7 @@ def level_axes():
     pitch_stage.move_home(blocking=True)
     
     check = 0
-    while not roll_stage.status_homed or not roll_stage.status_homed:
+    while not roll_stage.status_homed or not pitch_stage.status_homed:
         check += 1
         sleep(1)
         if check >= 20:
@@ -135,7 +135,10 @@ def convert_signed(pos):
     if pos >= 0.0:
         return pos - (pos // 180) * 360
     return pos
-    
+
+def convert_unsigned(pos):
+    """Translate `pos` from signed [-180, 180] range to signed [0, 360] range."""
+    return (pos + 360) % 360
 
 class DummyProcedure(Procedure):
     """

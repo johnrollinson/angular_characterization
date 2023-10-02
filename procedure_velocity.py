@@ -17,7 +17,9 @@ from stage.motor_ini.core import find_stages
 
 from agilent import E364A
 from keithley import Keithley6487
-from procedures import move_jog, move_stage_to, set_jog_step
+from procedures import move_jog, move_stage_to, set_jog_step, level_axes, convert_unsigned
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
@@ -43,27 +45,6 @@ if len(stages) != 0:
 else:
     log.error("No motor stages found.")
 
-def oscillate_stage(stage: MotorCtrl, min_angle, max_angle, velocity, stop_mode=1, interval=0.1):
-    # Set stage to starting position
-    move_stage_to(stage, min_angle)
-
-    # Set the maximum move velocity
-    stage.set_max_vel(velocity)
-    direction = 2
-
-    # Start the velocity movement
-    stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
-    while True:
-        if direction == 1 and stage.pos > max_angle:
-            direction = direction%2 + 1
-            stage._port.send_message(MGMSG_MOT_MOVE_STOP(chan_ident=stage._chan_ident, stop_mode=stop_mode))
-            stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
-        elif direction == 2 and stage.pos < min_angle:
-            direction = direction%2 + 1
-            stage._port.send_message(MGMSG_MOT_MOVE_STOP(chan_ident=stage._chan_ident, stop_mode=stop_mode))
-            stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
-        sleep(interval)
-
 class VelocityAngleSweep(Procedure):
     """
     Sweep angle over specified range and measure photocurrent at each increment.
@@ -82,14 +63,12 @@ class VelocityAngleSweep(Procedure):
 
     test_name = Parameter("Test Name")
 
-    sweep_roll = BooleanParameter("Sweep Roll Axis", default=True)
     roll_angle_start = FloatParameter(
         "Roll Start Angle",
         minimum=-45,
         maximum=45,
         units="deg",
         default=0,
-        group_by="sweep_roll",
     )
     roll_angle_stop = FloatParameter(
         "Roll Stop Angle",
@@ -97,34 +76,30 @@ class VelocityAngleSweep(Procedure):
         maximum=45,
         units="deg",
         default=20,
-        group_by="sweep_roll",
     )
     roll_angle_vel = FloatParameter(
         "Roll Angle Velocity ",
         units="deg/sec",
-        default=0.1,
-        group_by="sweep_roll",
+        default=10,
     )
-
-    sweep_pitch = BooleanParameter("Sweep Pitch Axis", default=True)
     pitch_angle_start = FloatParameter(
         "Pitch Start Angle",
         minimum=-45,
         maximum=45,
         units="deg",
-        default=2.5,
-        group_by="sweep_pitch",
+        default=5,
     )
     pitch_angle_stop = FloatParameter(
         "Pitch Stop Angle",
         minimum=-45,
         maximum=45,
         units="deg",
-        default=-2.5,
-        group_by="sweep_pitch",
+        default=-5,
     )
-    pitch_angle_step = FloatParameter(
-        "Pitch Angle Step", units="deg", default=0.1, group_by="sweep_pitch"
+    pitch_angle_vel = FloatParameter(
+        "Pitch Angle Velocity ",
+        units="deg/sec",
+        default=1,
     )
 
     delay = FloatParameter("Trigger Delay", units="ms", default=10)
@@ -132,7 +107,7 @@ class VelocityAngleSweep(Procedure):
         "Detector Bias Voltage", minimum=-3, maximum=3, units="V", default=0
     )
     laser_current = FloatParameter(
-        "Optical Source Current", units="mA", maximum=200
+        "Optical Source Current", units="mA", maximum=300
     )
 
     DATA_COLUMNS = ["Roll Angle", "Pitch Angle", "Detector Current"]
@@ -151,17 +126,15 @@ class VelocityAngleSweep(Procedure):
     def startup(self):
         # Connect to picoammeter and set up current measurement
         log.info("Connecting and configuring the picoammeter ...")
-        adapter = VISAAdapter(
-            "GPIB0::22::INSTR", visa_library="@py", query_delay=0.1
-        )
+        adapter = VISAAdapter("GPIB0::22::INSTR", visa_library="@py")
         self.picoammeter = Keithley6487(adapter)
+        self.picoammeter.write("*RST")
         self.picoammeter.configure(nplc=0.1, n_avg=1)
         self.picoammeter.set_bias_voltage(self.bias_voltage)
-        # Set up continuous triggering
-        self.picoammeter.write("ARM:SOUR IMM")
-        self.picoammeter.write("ARM:COUN 1")
-        self.picoammeter.write("TRIG:SOUR IMM")
-        self.picoammeter.write("TRIG:COUN INF")
+        # self.picoammeter.write("ARM:SOUR IMM")  # Continuous triggering
+        # self.picoammeter.write("ARM:COUN 1")
+        # self.picoammeter.write("TRIG:SOUR IMM")
+        # self.picoammeter.write("TRIG:COUN INF")
         log.info("Picoammeter configuration complete.")
 
         # Set the laser diode power
@@ -176,213 +149,78 @@ class VelocityAngleSweep(Procedure):
         self.power_supply.enabled = "ON"
         self.power_supply.trigger()
 
-        # Set the roll and pitch jog step size
-        log.info(
-            f"Setting roll jog step size to {abs(self.pitch_angle_stop - self.roll_angle_start)}deg"
-        )
-        set_jog_step(
-            self.pitch_stage,
-            abs(self.pitch_angle_stop - self.roll_angle_start),
-            self.roll_angle_vel,
-        )
-        log.info(
-            f"Setting pitch jog step size to {abs(self.pitch_angle_step)}deg"
-        )
-        set_jog_step(self.pitch_stage, abs(self.pitch_angle_step), 9.98)
-
         # Calibrate the stage positions
         self.roll_stage.set_vel_params(24.99, 25, 25)
         self.pitch_stage.set_vel_params(24.99, 25, 25)
-        log.info("Homing the roll and pitch axes")
-        self.roll_stage.set_home_dir(2)
-        self.pitch_stage.set_home_dir(1)
-        self.roll_stage.move_home(blocking=True)
-        self.pitch_stage.move_home(blocking=True)
-        check = 0
-        while (
-            not self.roll_stage.status_homed or not self.roll_stage.status_homed
-        ):
-            check += 1
-            sleep(1)
-            if check >= 20:
-                log.warning(
-                    "Homing timed out (20s), stages may not have homed successfully."
-                )
-                break
-
-        # Level the two stage axes
-        log.info("Levelling the roll and pitch stages")
-        move_stage_to(self.roll_stage, self.roll_offset, blocking=True)
-        move_stage_to(self.pitch_stage, self.pitch_offset, blocking=True)
-        check = 0
-        while not np.isclose(
-            self.roll_stage.pos, self.roll_offset, atol=0.01
-        ) or not np.isclose(self.pitch_stage.pos, self.pitch_offset, atol=0.01):
-            check += 1
-            sleep(1)
-            if check >= 20:
-                log.warning(
-                    "Levelling timed out (20s), stages may not have levelled successfully."
-                )
-                break
+        level_axes()
 
     def execute(self):
         log.info("Executing procedure.")
-        if self.sweep_roll:
-            # Move roll axis to the starting angle
-            log.info(
-                "Moving roll axis to starting angle: {}.".format(
-                    self.roll_angle_start
-                )
-            )
-            move_stage_to(
-                self.roll_stage,
-                self.roll_angle_start + self.roll_offset,
-                blocking=True,
-            )
-            check = 0
-            while not np.isclose(
-                self.roll_stage.pos,
-                self.roll_angle_start + self.roll_offset,
-                atol=0.01,
-            ):
-                check += 1
-                sleep(1)
-                if check >= 20:
-                    log.warning(
-                        "Moving roll to start position timed out (20s), stage move may not have succeeded."
-                    )
-                    break
-            n_steps_roll = 1
-            roll_dir = 1 if self.roll_angle_stop < self.roll_angle_start else 2
-        else:
-            n_steps_roll = 1
-
-        if self.sweep_pitch:
-            # Move pitch axis to the starting angle
-            log.info(
-                "Moving pitch axis to starting angle: {}.".format(
-                    self.pitch_angle_start
-                )
-            )
-            move_stage_to(
-                self.pitch_stage,
-                self.pitch_angle_start + self.pitch_offset,
-                blocking=True,
-            )
-            check = 0
-            while not np.isclose(
-                self.pitch_stage.pos,
-                self.pitch_angle_start + self.pitch_offset,
-                atol=0.01,
-            ):
-                check += 1
-                sleep(1)
-                if check >= 20:
-                    log.warning(
-                        "Moving pitch to start position timed out (20s), stage move may not have succeeded."
-                    )
-                    break
-            n_steps_pitch = int(
-                np.abs(self.pitch_angle_stop - self.pitch_angle_start)
-                / np.abs(self.pitch_angle_step)
-                + 1
-            )
-            pitch_dir = (
-                1 if self.pitch_angle_stop < self.pitch_angle_start else 2
-            )
-        else:
-            n_steps_pitch = 1
-
-        iterations = n_steps_pitch * n_steps_roll
-        k = 0
 
         log.info("Beginning measurement")
-        for i in range(n_steps_pitch):
-            # Set the constant velocity
-            # self.roll_stage.set_jog(self.roll_angle_vel, self.roll_angle_vel+0.01, 25)
 
-            # Initiate constant velocity position sweep
-            move_jog(self.roll_stage, roll_dir)
+        args = [
+            ["roll", self.roll_stage, self.roll_angle_start+self.roll_offset, self.roll_angle_stop+self.roll_offset, self.roll_angle_vel],
+            ["pitch", self.pitch_stage, self.pitch_angle_start+self.pitch_offset, self.pitch_angle_stop+self.pitch_offset, self.pitch_angle_vel]
+        ]
 
-            # Initiate constant readings trigger
-            self.picoammeter.write("INIT")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            threads = {executor.submit(self.oscillate_stage, *arg[1:]): arg[0] for arg in args}
+            threads[executor.submit(self.current_measurement)] = "current_meas"
+            for stage_name in as_completed(threads):
+                print(stage_name)
 
-            # Monitor position until we get to the final position
-            check = 0
-            while not np.isclose(
-                self.roll_stage.pos,
-                self.roll_angle_stop + self.roll_offset,
-                atol=0.01,
-            ):
-                check += 1
-                sleep(0.1)
-                if check >= 300:
-                    log.warning(
-                        "Moving roll to start position timed out (30s), stage move may not have succeeded."
-                    )
-                    break
-
-            # Stop the triggering
-            self.picoammeter.write("ABOR")
-
-            # Read the buffer
-            n_samples = int(self.picoammeter.buffer_size)
-            log.info(f"Buffer size: {n_samples}")
-            trace_data = self.picoammeter.ask(":TRAC:DATA?").replace("A", "")
-            trace_data = np.fromstring(trace_data, sep=",").reshape(
-                (n_samples, 4)
+        log.info("Procedure completed.")
+    
+    def current_measurement(self):
+        meas_interval = 0.01
+        while True:
+            curr = self.picoammeter.get_current()
+            self.emit(
+                "results",
+                {
+                    "Roll Angle": self.roll_stage.pos - self.roll_offset,
+                    "Pitch Angle": self.pitch_stage.pos - self.pitch_offset,
+                    "Detector Current": curr,
+                },
             )
-            roll_angles = np.linspace(
-                self.roll_angle_start, self.roll_angle_stop, n_samples
-            )
-            log.debug(trace_data)
-            [
-                self.emit(
-                    "results",
-                    {
-                        "Roll Angle": roll_angles[i],
-                        "Pitch Angle": self.pitch_stage.pos - self.pitch_offset,
-                        "Detector Current": trace_data[i, 0],
-                    },
-                )
-                for i in range(n_samples)
-            ]
-
-            # Set max move velocity and move back to start
-            self.roll_stage.set_vel_params(24.99, 25, 25)
-            log.info(
-                "Moving roll axis to starting angle: {}.".format(
-                    self.roll_angle_start
-                )
-            )
-            move_stage_to(
-                self.roll_stage,
-                self.roll_angle_start + self.roll_offset,
-                blocking=True,
-            )
-            check = 0
-            while not np.isclose(
-                self.roll_stage.pos,
-                self.roll_angle_start + self.roll_offset,
-                atol=0.01,
-            ):
-                check += 1
-                sleep(1)
-                if check >= 20:
-                    log.warning(
-                        "Moving roll to start position timed out (20s), stage move may not have succeeded."
-                    )
-                    break
-
-            # Step pitch
-            move_jog(self.pitch_stage, pitch_dir)
-
             if self.should_stop():
                 log.info("Caught stop flag during procedure.")
                 break
+            # sleep(meas_interval)
 
-        log.info("Procedure completed.")
+    def oscillate_stage(self, stage: MotorCtrl, min_angle, max_angle, velocity, interval=0.1):
+        # TODO: The logic of this method needs to be more robust against all cases
+        # e.g. right now this function cannot handle the case when 0 in [min_angle, max_angle]
+        # as it will get confused about the angular wrapping
+
+        # Set stage to starting position
+        move_stage_to(stage, min_angle, blocking=True)
+
+        # Set the maximum move velocity
+        stage.set_max_vel(velocity)
+        direction = 2
+
+        # min_angle = convert_unsigned(min_angle)
+        # max_angle = convert_unsigned(max_angle)
+
+        # Start the velocity movement
+        stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+        while True:
+            pos = stage.pos
+            if direction == 2 and pos > max_angle:
+                direction = direction%2 + 1
+                stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+            elif direction == 1 and pos < min_angle:
+                direction = direction%2 + 1
+                stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+            
+            if self.should_stop():
+                log.info("Caught stop flag during procedure.")
+                stage._port.send_message(MGMSG_MOT_MOVE_STOP(chan_ident=stage._chan_ident, stop_mode=2))
+                break
+            
+            sleep(interval)
 
     def shutdown(self):
         # TODO: After procedure completes, return both axes to 0deg
@@ -400,3 +238,78 @@ class VelocityAngleSweep(Procedure):
         #     pass
         # sleep(2)
         # del self.roll_stage, self.pitch_stage
+
+
+if __name__ == "__main__":
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def oscillate_stage(stage: MotorCtrl, min_angle, max_angle, velocity, interval=0.1):
+        # TODO: The logic of this method needs to be more robust against all cases
+        # e.g. right now this function cannot handle the case when 0 in [min_angle, max_angle]
+        # as it will get confused about the angular wrapping
+
+        # Set stage to starting position
+        move_stage_to(stage, min_angle, blocking=True)
+
+        # Set the maximum move velocity
+        stage.set_max_vel(velocity)
+        direction = 2
+
+        # min_angle = convert_unsigned(min_angle)
+        # max_angle = convert_unsigned(max_angle)
+
+        # Start the velocity movement
+        stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+        try:
+            print(min_angle, max_angle)
+            while True:
+                pos = stage.pos
+                print(pos)
+                if direction == 2 and pos > max_angle:
+                    print("Reverse")
+                    direction = direction%2 + 1
+                    stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+                elif direction == 1 and pos < min_angle:
+                    print("Reverse")
+                    direction = direction%2 + 1
+                    stage._port.send_message(MGMSG_MOT_MOVE_VELOCITY(chan_ident=stage._chan_ident, direction=direction))
+                
+                sleep(interval)
+        except:
+            stage._port.send_message(MGMSG_MOT_MOVE_STOP(chan_ident=stage._chan_ident, stop_mode=2))
+
+    roll_stage.set_max_vel(25)
+    pitch_stage.set_max_vel(25)
+    level_axes()
+
+    roll_offset = 45
+    pitch_offset = -32.7
+
+    args = [
+        ["roll", roll_stage, -20+roll_offset, 0+roll_offset, 10],
+        ["pitch", pitch_stage, -5+pitch_offset, 5+pitch_offset, 1]
+    ]
+
+    oscillate_stage(pitch_stage, -5+pitch_offset, 5+pitch_offset, 10)
+
+    # adapter = VISAAdapter("GPIB0::22::INSTR", visa_library="@py")
+    # picoammeter = Keithley6487(adapter)
+    # picoammeter.configure(nplc=0.1, n_avg=1)
+    # picoammeter.write("ARM:SOUR IMM")  # Continuous triggering
+    # picoammeter.write("ARM:COUN 1")
+    # picoammeter.write("TRIG:SOUR IMM")
+    # picoammeter.write("TRIG:COUN INF")
+
+    # while True:
+    #     roll_pos = roll_stage.pos - roll_offset
+    #     pitch_pos = pitch_stage.pos - pitch_offset
+    #     curr = picoammeter.get_current()
+    #     print(roll_pos, pitch_pos, curr)
+    #     sleep(0.1)
+
+    # with ThreadPoolExecutor(max_workers=4) as executor:
+    #     threads = {executor.submit(oscillate_stage, *arg[1:]): arg[0] for arg in args}
+    #     for stage_name in as_completed(threads):
+    #         print(stage_name)
+
+    # sleep(120)

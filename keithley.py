@@ -86,7 +86,7 @@ class Keithley6487(Instrument):
 
     def get_current(self):
         """ Trigger and return a single current reading. """
-        self.write("INIT")
+        # self.write("INIT")
         resp = self.ask("READ?").split(',')
         current = float(resp[0].strip('A'))
         return current
@@ -97,8 +97,6 @@ class Keithley6487(Instrument):
         self.write(f"SOUR:VOLT {voltage:.2f}")
         self.write("SOUR:VOLT:ILIM 2.5e-5")
         self.write("SOUR:VOLT:STAT ON")
-
-    # def
 
 
 if __name__ == "__main__":
